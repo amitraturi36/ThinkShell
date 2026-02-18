@@ -1,7 +1,9 @@
 import os
 
-from llm.openAI import ai_terminal
+from llm.openaiintegrator import OpenAiIntegrator
 
+# Initialize globally to maintain conversation history
+openai_integrator = OpenAiIntegrator()
 
 def get_bash_command(user_query):
     """
@@ -10,7 +12,7 @@ def get_bash_command(user_query):
     # --- 1. OpenAI ---
     if os.environ.get("OPENAI_API_KEY"):
         try:
-            return ai_terminal(user_query)
+            return openai_integrator.ai_terminal(user_query)
         except ImportError:
             return "echo ' Error: pip install openai'"
         except Exception as e:
