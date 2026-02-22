@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import platform
@@ -6,12 +7,18 @@ import shlex
 import subprocess
 
 from openai import OpenAI
+from pydantic import Json
 
 
 class OpenAiIntegrator:
     LLM_RESPONSE_ID = None
     CONTEXT_TRACKER = 0
     MAX_CONTEXT_LENGTH = 20
+    PENDING_ASK = None
+    PENDING_ASK_ORIGINAL_INPUT = None
+    PENDING_REVIEW = None
+    PENDING_REVIEW_HASH = None
+    PENDING_REVIEW_REASON = None
     SYSTEM_PROMPT = """
     You are an AI File-Aware Developer Platform Bash Decision Agent for All Operating Systems.
     
@@ -215,6 +222,10 @@ class OpenAiIntegrator:
     First: {"action": "INSPECT", "commands": ["command -v npx", "node --version"], "reason": null}
     Then: {"action": "EXECUTE", "commands": ["npx create-react-app my-app"], "reason": null}
     
+    USER: "HI/Hello/Good morning"
+    First: {"action": "ASK", "commands": [], "reason": "No task specified. What would you like to build, run, or inspect?"}
+    Then: {"action": "EXECUTE", "commands": ["npx create-react-app my-app"], "reason": null}
+    
     USER: "Why is app slow? Check logs"
     First: {"action": "INSPECT", "commands": ["tail -n 100 /var/log/app.log"], "reason": null}
     If insufficient: {"action": "UPLOAD", "commands": ["/var/log/app.log"], "reason": "Need full log analysis to identify performance bottlenecks"}
@@ -234,6 +245,28 @@ class OpenAiIntegrator:
     - If resolved path is '/', BLOCK immediately.
     - Treat '.', './', '../', or empty paths as UNKNOWN until inspected.
     """.strip()
+    RESPONSE_SCHEMA = {
+        "type": "json_schema",
+        "name": "agent_decision",
+        "schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["INSPECT", "EXECUTE", "REVIEW", "ASK", "UPLOAD", "BLOCK"]
+                },
+                "commands": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                },
+                "reason": {
+                    "type": ["string", "null"]
+                }
+            },
+            "required": ["action", "commands", "reason"],
+            "additionalProperties": False
+        }
+    }
 
     def __init__(self):
         key = self._get_openai_key()
@@ -242,7 +275,7 @@ class OpenAiIntegrator:
         else:
             self.client = OpenAI()
 
-    DEFAULT_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-nano")
+    DEFAULT_MODEL = "gpt-5-nano"
 
     # ---------------- Runtime Guard ---------------- #
 
@@ -305,6 +338,10 @@ class OpenAiIntegrator:
                 return True
         return False
 
+    def _hash_commands(self, commands: list[str]) -> str:
+        joined = "\n".join(commands).encode("utf-8")
+        return hashlib.sha256(joined).hexdigest()
+
     def _validate_file(self, path: str) -> bool:
         if not os.path.exists(path):
             print(f"echo 'File not found: {path}'")
@@ -352,22 +389,16 @@ class OpenAiIntegrator:
         except Exception as e:
             return f"ERROR: {str(e)}"
 
-    def call_llm(self, messages: list[dict]) -> dict:
-        if not self.client:
-            raise RuntimeError("OpenAI client not initialized")
+    def call_llm(self, event: str) -> dict:
+        response = self.client.responses.create(
+            model=self.DEFAULT_MODEL,
+            previous_response_id=self.LLM_RESPONSE_ID,
+            input=event,
+            text={"format": self.RESPONSE_SCHEMA}
+        )
 
-        try:
-            response = self.client.responses.create(
-                model=self.DEFAULT_MODEL,
-                previous_response_id=self.LLM_RESPONSE_ID,
-                input=self.to_responses_input(messages),
-                text={"format": {"type": "json_object"}}
-            )
-            self.LLM_RESPONSE_ID = response.id
-            return json.loads(response.output_text)
-        except Exception as e:
-            # Fallback for JSON error or API error - return a safe error action so the loop handles it
-            return {"action": "BLOCK", "reason": f"LLM Error: {str(e)}", "commands": []}
+        self.LLM_RESPONSE_ID = response.id
+        return json.loads(response.output_text)
 
     def _summarize_and_reset(self):
         summary_resp = self.client.responses.create(
@@ -376,12 +407,11 @@ class OpenAiIntegrator:
             input="Summarize the session so far for future continuation.",
         )
         summary_text = summary_resp.output_text
-        messages = self.get_init_llm_message()
-        messages.append({"role": "system", "content": f"SESSION_SUMMARY: {summary_text}"})
         # Start a fresh conversation WITH that summary
         new_resp = self.client.responses.create(
             model=self.DEFAULT_MODEL,
-            input=self.to_responses_input(messages),
+            instructions=self.SYSTEM_PROMPT,
+            input=f"SESSION SUMMARY: {summary_text}",
             text={"format": {"type": "json_object"}}
         )
 
@@ -398,145 +428,166 @@ class OpenAiIntegrator:
         return [c for c in cmds if isinstance(c, str) and c.strip()]
 
     def _interactive_review_snippet(self, reason: str, commands: list[str]) -> str:
-        # Build a bash snippet that prints context and asks the user before executing.
-        lines: list[str] = [
-            f"printf '%s\\n' {self._bash_quote('Review required: ' + (reason or 'Confirmation needed.'))}",
-            "printf '%s\\n' 'Proposed commands:'"]
-        for cmd in commands:
-            lines.append(f"printf '  %s\\n' {self._bash_quote(cmd)}")
+        try:
+            self.reset_ask_loop()
 
-        # Safety gate again before emitting runnable code.
+            if not commands:
+                return self.safe_echo("Nothing to review.")
+
+            for cmd in commands:
+                if not self.is_runtime_safe(cmd):
+                    return self.safe_echo(f"Blocked unsafe command: {cmd}")
+            self.PENDING_REVIEW = commands
+            self.PENDING_REVIEW_HASH = self._hash_commands(commands)
+            self.PENDING_REVIEW_REASON = str(reason or "")
+            preview = "\n".join(commands)
+            return f"REVIEW REQUIRED: {self.PENDING_REVIEW_REASON}\n\nProposed Commands: {preview} \n\nIf you approve, run:confirm:yes"
+        except Exception as e:
+            return f"ERROR-----Review block: {str(e)}"
+
+    def _execute_review(self, user_input: str) -> str | None:
+        """
+        Handles confirm:yes without involving the LLM.
+        Returns shell output if confirmation was processed,
+        otherwise None to continue normal flow.
+        """
+        if user_input.strip().lower() != "confirm:yes":
+            return None
+
+        if not self.PENDING_REVIEW:
+            return "No pending operation to confirm."
+
+        commands = self.PENDING_REVIEW
+        expected_hash = self.PENDING_REVIEW_HASH
+
+        # Integrity check (anti-tamper)
+        if self._hash_commands(commands) != expected_hash:
+            self.PENDING_REVIEW = None
+            self.PENDING_REVIEW_HASH = None
+            self.PENDING_REVIEW_REASON = None
+            return "Review invalidated (command mismatch)."
+
+        output = []
         for cmd in commands:
             if not self.is_runtime_safe(cmd):
-                return self.safe_echo("Execution blocked by runtime safety guard.")
+                self.PENDING_REVIEW = None
+                self.PENDING_REVIEW_HASH = None
+                self.PENDING_REVIEW_REASON = None
+                return f"Blocked during execution: {cmd}"
 
-        lines.append("read -r -p 'Proceed? [y/N] ' TS_PROCEED")
-        lines.append("case \"$TS_PROCEED\" in")
-        lines.append("  y|Y|yes|YES)")
-        lines.append("    set -e")
-        for cmd in commands:
-            lines.append(f"    {cmd}")
-        lines.append("    ;;")
-        lines.append("  *) echo 'Aborted.' ;;")
-        lines.append("esac")
-        return "\n".join(lines)
+            output.append(self.run_command(cmd))
 
-    def _interactive_ask_snippet(self, original_intent: str, question: str) -> str:
-        # Ask one question, then re-call the controller with the answer appended.
-        q = question or "Need more information."
-        lines: list[str] = [f"printf '%s\\n' {self._bash_quote(q)}", "read -r -p '> ' TS_ANSWER",
-                            f"TS_FOLLOWUP={self._bash_quote(original_intent)}",
-                            'TS_NEW_QUERY="$TS_FOLLOWUP\n\nUSER_ANSWER: $TS_ANSWER"',
-                            'agentresponse="$($TSPY $TSCTL FAIL \"$TS_NEW_QUERY\")"',
-                            'if [ -n "$agentresponse" ]; then eval "$agentresponse"; fi']
-        return "\n".join(lines)
+        # Clear state (commit complete)
+        self.PENDING_REVIEW = None
+        self.PENDING_REVIEW_HASH = None
+        self.PENDING_REVIEW_REASON = None
+
+        return "\n".join(output) if output else "Done."
 
     @staticmethod
-    def to_responses_input(messages: list[dict]) -> list[dict]:
-        input_items = []
-        for m in messages:
-            content_list: list[dict] = []
-            content_str = m["content"]
-
-            # Check for UPLOADED_FILES pattern
-            if m["role"] == "system" and isinstance(content_str, str) and content_str.startswith("UPLOADED_FILES:"):
-                try:
-                    json_str = content_str[len("UPLOADED_FILES:"):].strip()
-                    files_map = json.loads(json_str)
-
-                    # Add a text intro
-                    content_list.append(
-                        {"type": "input_text", "text": "The following files have been uploaded for analysis:"})
-
-                    for path, file_id in files_map.items():
-                        if file_id == "UPLOAD_FAILED" or file_id == "VALIDATION_FAILED":
-                            content_list.append({"type": "input_text", "text": f"\nFailed to upload {path}: {file_id}"})
-                        else:
-                            content_list.append({
-                                "type": "input_file",
-                                "file_id": file_id,
-                                "filename": os.path.basename(path)
-                            })
-                except json.JSONDecodeError:
-                    # Fallback
-                    content_list.append({"type": "input_text", "text": content_str})
-            else:
-                # Use input_text type for standard text content
-                content_list.append({"type": "input_text", "text": content_str})
-
-            input_items.append({"role": m["role"], "content": content_list})
-        return input_items
-
-    def get_init_llm_message(self):
-        return [
-            {"role": "system", "content": self.SYSTEM_PROMPT},
-            {"role": "system", "content": f"OS_INFO: {self.OS_INFO}"}
-        ]
+    def _emit_pause(message: str) -> str:
+        return f"{message}\n\n⏸ Execution paused. Respond to continue."
 
     def init_ai_terminal(self):
-        messages: list[dict] = self.get_init_llm_message()
-        # Just init the conversation. The output is likely acknowledgment or empty since no user input.
-        try:
-            self.call_llm(messages)
-        except Exception:
-            pass  # Ignore init errors, ai_terminal will retry or fail gracefullyexit
+        response = self.client.responses.create(
+            model=self.DEFAULT_MODEL,
+            instructions=self.SYSTEM_PROMPT,
+            input=f"OS_INFO: {json.dumps(self.OS_INFO)}"
+        )
 
+        self.LLM_RESPONSE_ID = response.id
+
+    def _interactive_ask_snippet(self, reason: str) -> str:
+        combined = (
+            f"ORIGINAL_REQUEST:\n{self.PENDING_ASK_ORIGINAL_INPUT}\n\n"
+            f"MODEL_QUESTION:\n{self.PENDING_ASK}\n\n"
+            f"USER_ANSWER:\n{reason}")
+        self.PENDING_ASK = None
+        return combined
+
+    def reset_ask_loop(self):
+        self.PENDING_ASK = None
+        self.PENDING_ASK_ORIGINAL_INPUT = None
+
+    def reset_review(self):
+        self.PENDING_REVIEW = None
+        self.PENDING_REVIEW_HASH = None
+        self.PENDING_REVIEW_REASON = None
+
+    def _interactive_call_llm(self, user_input: str, is_ask_resume: bool) -> dict:
+        if not is_ask_resume:
+            self.CONTEXT_TRACKER += 1
+            return self.call_llm(f"USER_INPUT: {user_input}")
+        return self.call_llm(f"ASK_RESPONSE: {user_input}")
+
+    def _cli_safe(self, text: str) -> str:
+        """
+        Escapes text so the outer CLI can safely wrap it in: echo '...'
+        """
+        return text.replace("'", "'\"'\"'")
 
     def ai_terminal(self, user_input: str) -> str:
+        """
+        Event-driven agent loop using Responses API correctly.
+        We NEVER resend conversation — we append events only.
+        """
+        review_result = self._execute_review(user_input)
+        if review_result is not None:
+            return self._cli_safe(review_result)
+        self.reset_review()
+        is_ask_resume = self.PENDING_ASK is not None
+        if is_ask_resume:
+            user_input = self._interactive_ask_snippet(user_input)
+
         if self.LLM_RESPONSE_ID is None:
             self.init_ai_terminal()
-
         elif self.CONTEXT_TRACKER > self.MAX_CONTEXT_LENGTH:
             self._summarize_and_reset()
             self.CONTEXT_TRACKER = 0
-
-        self.CONTEXT_TRACKER = self.CONTEXT_TRACKER + 1
-
-        """Return bash code that the shell will eval."""
-        messages: list[dict] = [
-            {"role": "system", "content": f"ORIGINAL_INTENT: {user_input}"},
-        ]
-
         MAX_STEPS = 12
         seen_inspects: set[str] = set()
         uploaded_files: set[str] = set()
 
-        last_sent_index = 0
-        for _ in range(MAX_STEPS):
-            # Only send new messages since last call
-            new_messages = messages[last_sent_index:]
-            if not new_messages and self.LLM_RESPONSE_ID:
-                # Should not happen typically unless we just want to poke the model?
-                pass
+        # ---- First Event: User Intent ----
+        llm_response = self._interactive_call_llm(user_input, is_ask_resume)
 
-            llm_response = self.call_llm(new_messages)
-            last_sent_index = len(messages)  # Mark all current messages as sent
+        for _ in range(MAX_STEPS):
 
             action = str(llm_response.get("action", "")).upper().strip()
             commands = self.normalize_commands(llm_response.get("commands", []))
             reason = llm_response.get("reason")
 
+            # ============================================================
+            # INSPECT  → run locally → send results back as next event
+            # ============================================================
             if action == "INSPECT":
                 inspection_output: dict[str, str] = {}
+
                 for cmd in commands:
                     if cmd in seen_inspects:
                         inspection_output[cmd] = "ERROR: repeated inspection detected"
                         continue
+
                     if not self.is_runtime_safe(cmd):
                         inspection_output[cmd] = "BLOCKED: runtime safety guard"
                         continue
+
                     print(f"echo 'Inspecting command: {cmd}'")
                     inspection_output[cmd] = self.run_command(cmd)
                     seen_inspects.add(cmd)
 
-                messages.append(
-                    {"role": "system",
-                     "content": f"INSPECTION_RESULT: {json.dumps(inspection_output, ensure_ascii=False)}"}
+                llm_response = self.call_llm(
+                    "INSPECTION_RESULT:\n" +
+                    json.dumps(inspection_output, ensure_ascii=False)
                 )
                 continue
 
+            # ============================================================
+            # UPLOAD → validate → upload → send file IDs back as event
+            # ============================================================
             if action == "UPLOAD":
                 payload: dict[str, str] = {}
+
                 for path in commands[:self.MAX_UPLOAD_FILES]:
                     if path in uploaded_files:
                         continue
@@ -544,6 +595,7 @@ class OpenAiIntegrator:
                     if self._validate_file(path):
                         print(f"echo 'Uploading file {path}'")
                         file_id = self._upload_file_to_llm(path)
+
                         if file_id:
                             payload[path] = file_id
                             uploaded_files.add(path)
@@ -552,32 +604,57 @@ class OpenAiIntegrator:
                     else:
                         payload[path] = "VALIDATION_FAILED"
 
-                messages.append(
-                    {"role": "system", "content": f"UPLOADED_FILES: {json.dumps(payload, ensure_ascii=False)}"}
+                llm_response = self.call_llm(
+                    "UPLOADED_FILES:\n" +
+                    json.dumps(payload, ensure_ascii=False)
                 )
                 continue
 
+            # ============================================================
+            # ASK → interactive shell handoff
+            # ============================================================
             if action == "ASK":
-                return self._interactive_ask_snippet(user_input, str(reason or ""))
+                if self.PENDING_ASK_ORIGINAL_INPUT is None:
+                    self.PENDING_ASK_ORIGINAL_INPUT = user_input
+                self.PENDING_ASK = str(reason or "Need more information.")
+                return self._cli_safe(self._emit_pause(
+                    self.PENDING_ASK + "\n\nProvide the answer in your next command."
+                ))
 
+            # ============================================================
+            # REVIEW → confirmation workflow
+            # ============================================================
             if action == "REVIEW":
-                return self._interactive_review_snippet(str(reason or ""), commands)
+                self.reset_ask_loop()
+                return self._cli_safe(self._interactive_review_snippet(str(reason or ""), commands))
 
+            # ============================================================
+            # EXECUTE → execute safe commands
+            # ============================================================
             if action == "EXECUTE":
                 result = []
+                self.reset_ask_loop()
                 for cmd in commands:
                     if not self.is_runtime_safe(cmd):
-                        return self.safe_echo("Execution blocked by runtime safety guard, for command : " + cmd)
-                    else:
-                        print(f"echo 'Executing command : {cmd}'")
-                        result.append(self.run_command(cmd))
-                # Execute in the user's shell so stateful operations (cd/export) work.
-                return "\n".join(result) if commands else self.safe_echo("No commands provided.")
+                        return self._cli_safe(
+                            "Execution blocked by runtime safety guard, for command : " + cmd
+                        )
 
+                    print(f"echo 'Executing command : {cmd}'")
+                    result.append(self.run_command(cmd))
+
+                return self._cli_safe("\n".join(result) if commands else self.safe_echo("No commands provided."))
+
+            # ============================================================
+            # BLOCK → hard stop
+            # ============================================================
             if action == "BLOCK":
-                return self.safe_echo(str(reason or "Action blocked."))
+                self.reset_ask_loop()
+                return self._cli_safe(str(reason or "Action blocked."))
 
-            # Unknown/invalid action -> ask for clarification.
-            messages.append({"role": "system", "content": "INVALID_ACTION: Return a valid action enum."})
+            # ============================================================
+            # Unknown action → ask model to correct itself (event again)
+            # ============================================================
+            llm_response = self.call_llm("INVALID_ACTION: Return a valid action enum.")
 
         return self.safe_echo("Agent timed out.")
