@@ -134,6 +134,11 @@ if [ -n "${BASH_VERSINFO:-}" ] && ((BASH_VERSINFO[0] >= 4)); then
         local agent_response
         agent_response=$("$TS_PY" "$TS_CTL" "FAIL" "$full_cmd")
 
+        rc=$?
+        if [ $rc -eq 130 ]; then
+          return 127
+        fi
+
         if [ -n "$agent_response" ]; then
             # Inject into history so 'Up Arrow' works
             history -s "$agent_response"
