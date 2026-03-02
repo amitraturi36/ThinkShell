@@ -1,3 +1,5 @@
 openai
 google-generativeai
 anthropic
+
+psutil

@@ -4,6 +4,7 @@ import sys
 import tempfile
 import atexit
 import shutil
+import uuid
 from pathlib import Path
 
 def get_controller_path():
@@ -51,6 +52,8 @@ def spawn_shell():
             # 1. Set Controller Environment Variables
             os.environ["TS_CTL"] = get_controller_path()
             os.environ["TS_PY"] = sys.executable
+            if "THINKSHELL_SESSION_ID" not in os.environ:
+                os.environ["THINKSHELL_SESSION_ID"] = str(uuid.uuid4())
 
             # Note: Do NOT call os.setsid() here. pty.fork() does it automatically.
             # Calling it again causes [Errno 1] Operation not permitted.
