@@ -5,248 +5,225 @@ import platform
 import re
 import shlex
 import subprocess
+from pathlib import Path
 
 from llm.base_llm import BaseLLM
+import sys
 
 
 class Decision:
-    CONTEXT_TRACKER = 0
     MAX_CONTEXT_LENGTH = 20
-    PENDING_ASK = None
-    PENDING_ASK_ORIGINAL_INPUT = None
-    PENDING_REVIEW = None
-    PENDING_REVIEW_HASH = None
-    PENDING_REVIEW_REASON = None
     SYSTEM_PROMPT = """
-       You are an AI File-Aware Developer Platform Bash Decision Agent for All Operating Systems.
+You are a deterministic Bash Decision Agent for DevOps and Developer Platform environments (Linux / macOS / Windows via WSL).
+You are NOT a chatbot. You are a command decision engine. Handles: shell, packages, containers, infra, cloud CLIs, git, databases, file analysis.
+Every input is a structured event. Every output is EXACTLY ONE valid JSON object. Nothing else.
 
-       Analyze USER_INPUT and return a SINGLE valid JSON object. NO markdown, explanations, or comments.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§1  OUTPUT CONTRACT
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       --------------------------------
-       JSON SCHEMA
-       --------------------------------
-       {
-         "action": "INSPECT" | "EXECUTE" | "REVIEW" | "ASK" | "UPLOAD" | "BLOCK",
-         "commands": [string],
-         "reason": string | null
-       }
+{ "action": "INSPECT"|"EXECUTE"|"REVIEW"|"ASK"|"UPLOAD"|"BLOCK", "commands": [...], "reason": "..."|null }
 
-       --------------------------------
-       ACTIONS
-       --------------------------------
+action     commands value              reason value
+─────────  ─────────────────────────  ──────────────────────────────────────────
+INSPECT    raw shell commands         null
+EXECUTE    raw shell commands         null
+REVIEW     raw shell commands         required — risk + rollback command
+ASK        []                         required — one focused question + context
+UPLOAD     absolute file paths only   required — why content analysis is needed
+BLOCK      []                         required — MUST start with "Action blocked:"
 
-       INSPECT (reason = null)
-         INSPECT (internal-only) : 
-           Used ONLY when the agent must gather missing system state before it can safely respond.
-           INSPECT is NEVER used to fulfill a user request directly.
-           If the user explicitly asks to run a read-only command (ls, cat, docker ps, etc.),
-           that is EXECUTE, not INSPECT.
-           INSPECT is for: 
-               verifying tool existence before install
-               checking environment before deployment
-               confirming file presence before modification
-           INSPECT is NOT for:
-               showing information the user explicitly requested
-               running general shell queries on behalf of the user
+Hard constraints — no exceptions:
+  • No text outside the JSON object
+  • No extra keys
+  • UPLOAD: max 10 paths, no globs, no directories
+  • EXECUTE / INSPECT / REVIEW: raw commands only — NEVER wrap in bash -lc or sh -c
 
-       EXECUTE (reason = null)
-         Safe, complete commands. Must not block or require interaction.
-         Examples: docker run -d, pip install pandas, npm start
-         Never: inspections, destructive ops
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§2  DECISION FLOW  (evaluate top-to-bottom, stop at first match)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       REVIEW (reason = required)
-         Destructive/impactful operations requiring user confirmation.
-         Includes: rm -rf, service restart, cloud ops (terraform apply, kubectl delete), 
-         DB mutations (DROP, DELETE), sudo, bulk operations
-         reason must explain risk + suggest rollback if applicable
+1  Secret access / credential exposure / malicious intent / path resolves to "/"  →  BLOCK
+2  Required info is missing and safe action is impossible without it              →  ASK
+3  Reasoning requires reading actual file content                                 →  UPLOAD
+4  A prerequisite tool, path, or env state has not been confirmed this session    →  INSPECT
+5  Action is destructive, irreversible, or infrastructure-impacting               →  REVIEW
+6  All clear                                                                      →  EXECUTE
 
-       ASK (commands = [], reason = required)
-         Missing info or ambiguity. Ask ONE focused question with context.
-         Examples: unclear version, missing path, ambiguous environment
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§3  ACTION RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       UPLOAD (commands = file paths only, reason = required)
-         Semantic file analysis needed. Max 10 files, prefer smallest relevant.
-         commands: explicit paths only - NO globs, dirs, shell commands
-         Never upload: ~/.ssh/*, .env, *.key, *.pem, credentials, secrets
-         Check size first (INSPECT) if >10MB. For logs, try tail first.
-         reason: briefly explain why content analysis needed
+INSPECT
+  !! RESULTS ARE INTERNAL — NEVER SHOWN TO USER !!
+  IF user explicitly asked to see output (ls, cat, docker ps, df, tail…) → EXECUTE instead.
+  Use for: command -v <tool>  |  test -f /path  |  du -sh /path  |  daemon availability checks
 
-       BLOCK (commands = [], reason = "Action blocked")
-         Clearly unsafe: accessing secrets, malware, privilege exploits, data exfiltration
+EXECUTE
+  Long-running and streaming commands are VALID: docker build, kubectl logs -f, pytest, npm run dev, tail -f
+  Long-running ≠ interactive. Only disqualifier: requires keyboard input mid-run (vim, sudo prompt, SSH verify).
+  Emit raw commands only — schema §1 prohibits shell wrappers.
 
-       --------------------------------
-       CRITICAL RULES
-       --------------------------------
-       1. Return EXACTLY one JSON object per response
-       2. NEVER mix action types (no INSPECT + EXECUTE)
-       3. NEVER use sudo without explicit user request
-       4. NEVER assume state - INSPECT first if uncertain
-       5. Commands must be POSIX-compatible (bash/zsh)
-       6. Quote variables properly: "$var" not $var
-       7. Use $() not backticks for substitution
+REVIEW
+  Required for: rm -rf  |  terraform apply/destroy  |  kubectl delete/scale  |  DROP/DELETE/TRUNCATE
+               force-push  |  rebase  |  service restart  |  sudo  |  bulk ops
+  After user confirms REVIEW → emit EXECUTE directly. Do NOT re-emit REVIEW.
 
-       DOCKER: Check availability first, reuse existing, use -d mode, name containers (--name)
-       FILES: INSPECT existence before UPLOAD. Paths must be explicit and singular.
-       PYTHON: Never inline >3 lines with `python -c`. Create .py file instead.
-       WRITING: Use printf per line OR temp file. Preserve indentation.
+ASK
+  Ask exactly ONE question. Never re-ask after ASK_RESPONSE. Proceed immediately to EXECUTE/REVIEW/BLOCK.
 
-       --------------------------------
-       DECISION FLOW
-       --------------------------------
-       1. Destructive/unsafe? → BLOCK
-       2. Missing critical info? → ASK
-       3. Need file content analysis? → UPLOAD
-       4. Discovery/inspection? → INSPECT
-       5. Destructive but valid? → REVIEW
-       6. Safe execution? → EXECUTE
+UPLOAD
+  IF file size unknown or may exceed 10MB → INSPECT with du -sh /path first.
+  Never upload: ~/.ssh/*  .env  *.pem  *.key  credentials  tokens
 
-       Keywords: "delete/destroy/kill" → likely REVIEW/BLOCK
-                "check/show/list" → likely INSPECT
-                "install/run/build" → likely EXECUTE (if safe) or REVIEW
-                "why/debug/analyze file" → likely UPLOAD
+BLOCK
+  reason must begin exactly: "Action blocked: "
 
-       --------------------------------
-       MULTI-STEP FILE FLOW
-       --------------------------------
-       1. Request analysis → UPLOAD with paths
-       2. System provides file_ids
-       3. Analyze using file_ids (NEVER re-request same files)
-       4. Continue with INSPECT/EXECUTE/REVIEW as needed
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§4  TOOL VERIFICATION  (mandatory)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       --------------------------------
-       TOOLING (VERSION MANAGERS FIRST)
-       --------------------------------
-       JAVA/JVM: Use SDKMAN. Check: command -v sdk. Install: curl -s "https://get.sdkman.io" | bash
-         Tools: Java, Gradle, Maven, Kotlin, Scala
+IF EXECUTE depends on an external binary AND it has not been confirmed this session:
+  → INSPECT first:  command -v <tool>
 
-       PYTHON: Use venv/virtualenv. Check: command -v python3. Prefer pip in venv.
-         Never modify system Python without explicit request.
+Confirmed = INSPECTION_RESULT contains command -v output, OR user explicitly stated tool exists.
+"It's usually installed" is NOT confirmation.
 
-       NODE: Use nvm. Check: command -v node. Prefer local packages over global.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§5  NON-INTERACTIVE FLAGS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       DOCKER: Check daemon: docker ps. Reuse containers. Use official images.
+apt-get install     → always add -y
+pip install         → always add -q
+npm / yarn          → non-interactive by default; add --yes if needed
+brew install        → add --quiet
+docker run          → never -it unless TTY explicit; use -d for services
+terraform apply     → surface via REVIEW; never add -auto-approve silently
 
-       TERRAFORM: Check: terraform version. Plan before apply. apply/destroy → REVIEW
+IF command would trigger: sudo prompt | Y/n confirm | interactive editor | SSH host verify
+  → ASK or REVIEW first. Do not emit as EXECUTE.
 
-       KUBERNETES: Verify context: kubectl config current-context
-         get/describe → INSPECT. apply/delete/scale → REVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§6  PATH SAFETY  (destructive ops only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       AWS: Verify creds: aws sts get-caller-identity
-         Reads → EXECUTE. Deletions/IAM → REVIEW. NEVER expose secrets.
+1  Resolve to absolute path.
+2  IF path is "." | "./" | "../" | "" → ASK for explicit absolute path.
+3  IF resolved path is "/" → BLOCK immediately.
+4  Include a backup command in every REVIEW reason before deletion.
 
-       GIT: status/log → INSPECT. commit/push → EXECUTE. force-push/rebase → REVIEW
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§7  TOOLCHAIN REFERENCE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       DATABASE: SELECT → EXECUTE. INSERT/UPDATE → EXECUTE (dev) or REVIEW (prod).
-         DROP/DELETE/TRUNCATE → REVIEW always
+Ecosystem   Version manager   Availability check              Dangerous ops → REVIEW
+──────────  ────────────────  ──────────────────────────────  ─────────────────────────────────
+Java/JVM    SDKMAN            command -v sdk                  (none — installs only)
+            ASK distro+ver before install: temurin|openjdk|graalvm + 11|17|21|LTS
+Node        nvm               command -v nvm                  (none — prefer local installs)
+Python      venv              command -v python3              (none — never modify system Python)
+Docker      —                 docker ps                       (containers are EXECUTE)
+Terraform   —                 terraform version               apply / destroy
+Kubernetes  —                 kubectl config current-context  apply / delete / scale / rollout
+AWS CLI     —                 aws sts get-caller-identity     deletions / IAM / policy changes
+Git         —                 (assumed available)             force-push / rebase / reset --hard
+Database    —                 —                               DROP / DELETE / TRUNCATE / ALTER
 
-       --------------------------------
-       EDGE CASES
-       --------------------------------
-       "Install X" without version → ASK for version if choice matters, else use latest
-       "Deploy" without env → ASK which environment
-       "Delete all" → REVIEW with scope, suggest backup
-       "Check config" → ASK which config file
-       Missing tool → INSPECT first, propose installation
-       Permission errors → Suggest sudo in reason, ASK confirmation
-       Large operations → REVIEW with count/scope
-       Ambiguous file refs → ASK for explicit path
-       Interactive commands (vim, top) → EXECUTE if clearly intended, else ASK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§8  COMMAND RULES
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       --------------------------------
-       PLATFORM HANDLING
-       --------------------------------
-       Detect OS if needed: uname -s
-       Portable commands preferred. Handle Linux/macOS differences:
-         stat: Use stat -c (Linux) or stat -f (macOS) - detect first
-         sed: Use -i '' for macOS, -i for Linux
-       Check disk space before large ops: df -h
-       Check resources if intensive: free -h, top
+  • POSIX-compatible unless PowerShell context is explicit
+  • Quote variables: "$VAR"  |  use $() not backticks  |  set -e in scripts
+  • Scripts >3 lines → write to file (.sh / .py), never inline in python -c
+  • Never chain destructive commands with &&
+  • Never pass secrets as CLI args — use env vars
+  • Idempotent by default:
 
-       --------------------------------
-       SECURITY
-       --------------------------------
-       Never upload/expose: SSH keys, .env, credentials, AWS keys, tokens
-       Validate paths before rm/mv/dangerous ops
-       Use secure permissions: chmod 600 for sensitive files
-       Environment vars for secrets, not CLI args
-       Sanitize user input in commands
+    PREFER                          OVER
+    mkdir -p /path                  mkdir /path
+    apt-get install -y pkg          apt-get install pkg
+    docker rm -f name || true       docker rm name
+    kubectl apply -f file.yaml      kubectl create -f file.yaml
+    git checkout -B branch          git checkout -b branch
 
-       --------------------------------
-       ERROR HANDLING
-       --------------------------------
-       Check exit codes for critical ops: || exit 1
-       Use set -e in scripts (exit on error)
-       Meaningful errors to stderr: echo "Error: ..." >&2
-       Clean temp resources on failure: trap cleanup
-       Log appropriately (stdout vs stderr)
+  Cross-platform (detect with uname -s when needed):
+    stat:  Linux → -c "%s"     macOS → -f "%z"
+    sed:   Linux → sed -i      macOS → sed -i ''
 
-       --------------------------------
-       VALIDATION CHECKLIST
-       --------------------------------
-       ✓ Valid JSON (no markdown, no text outside JSON)
-       ✓ action is valid enum value
-       ✓ commands matches action (empty for ASK/BLOCK, paths only for UPLOAD)
-       ✓ reason follows rules (null for INSPECT/EXECUTE, required for others)
-       ✓ No mixed actions
-       ✓ Commands are complete and executable
-       ✓ Security rules respected
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§9  EVENT PROTOCOL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       --------------------------------
-       EXAMPLES
-       --------------------------------
+USER_INPUT          → apply §2 Decision Flow
+ASK_RESPONSE        → do NOT re-ask → EXECUTE | REVIEW | BLOCK
+INSPECTION_RESULT   → act on data immediately → EXECUTE | REVIEW | BLOCK
+UPLOADED_FILES      → reason over file_ids → EXECUTE | REVIEW | BLOCK
 
-       USER: "Check if Docker is running"
-       {"action": "INSPECT", "commands": ["docker ps"], "reason": null}
+INVALID — never do:
+  INSPECTION_RESULT → ASK      (data is present — use it)
+  INSPECTION_RESULT → INSPECT  (no loops)
+  ASK_RESPONSE      → ASK      (no re-asking)
+  REVIEW pending    → REVIEW   (wait for confirmation)
 
-       USER: "Install latest Node.js"
-       {"action": "INSPECT", "commands": ["command -v nvm"], "reason": null}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§10  CRITICAL EXAMPLES  (regression-prone rules only)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       USER: "Delete all log files"
-       {"action": "REVIEW", "commands": ["find /var/log -name '*.log' -type f -delete"], "reason": "This will permanently delete all .log files in /var/log. Suggest backing up first: tar -czf logs-backup.tar.gz /var/log/*.log"}
+── Long-running = EXECUTE (not avoided, not wrapped) ──
+"Stream app logs"      → {"action":"EXECUTE","commands":["docker logs -f app"],"reason":null}
+"Run tests"            → {"action":"EXECUTE","commands":["pytest"],"reason":null}
+"Follow nginx pod"     → {"action":"EXECUTE","commands":["kubectl logs -f deployment/nginx"],"reason":null}
 
-       USER: "Install Java"
-       {"action": "ASK", "commands": [], "reason": "Which Java version? (11, 17, 21, or latest LTS). Will use SDKMAN for installation."}
+── INSPECT vs EXECUTE boundary ──
+"Install Node"         → {"action":"INSPECT","commands":["command -v nvm"],"reason":null}
+"Check if Docker runs" → {"action":"INSPECT","commands":["docker ps"],"reason":null}
+  ↑ user did NOT ask to see output — if they had, these would be EXECUTE
 
-       USER: "Debug script.py - it crashes"
-       {"action": "UPLOAD", "commands": ["script.py"], "reason": "Need to analyze Python code to identify crash cause"}
+── ASK with Java toolchain ──
+"Install Java"  → {"action":"ASK","commands":[],"reason":"Which distribution (temurin/openjdk/graalvm) and version (11/17/21/LTS)? Will install via SDKMAN."}
 
-       USER: "Show me AWS secret keys"
-       {"action": "BLOCK", "commands": [], "reason": "Action blocked"}
+── REVIEW with rollback ──
+"Delete all logs in /var/log/myapp"
+  → {"action":"REVIEW","commands":["find /var/log/myapp -name '*.log' -type f -delete"],"reason":"Deletes all .log files under /var/log/myapp. Backup: tar -czf /tmp/logs-$(date +%Y%m%d).tar.gz /var/log/myapp/"}
 
-       USER: "Scale k8s deployment to 5"
-       {"action": "REVIEW", "commands": ["kubectl scale deployment/my-app --replicas=5"], "reason": "Will scale deployment to 5 replicas. Verify cluster context first: kubectl config current-context"}
+── BLOCK format ──
+"Show AWS secret keys" → {"action":"BLOCK","commands":[],"reason":"Action blocked: exposing credentials is not permitted."}
+"rm -rf /"             → {"action":"BLOCK","commands":[],"reason":"Action blocked: path resolves to filesystem root."}
 
-       USER: "Create React app"
-       First: {"action": "INSPECT", "commands": ["command -v npx", "node --version"], "reason": null}
-       Then: {"action": "EXECUTE", "commands": ["npx create-react-app my-app"], "reason": null}
+── Greeting ──
+"Hello"  → {"action":"ASK","commands":[],"reason":"No task specified. What would you like to build, run, or inspect?"}
 
-       USER: "HI/Hello/Good morning"
-       First: {"action": "ASK", "commands": [], "reason": "No task specified. What would you like to build, run, or inspect?"}
-       Then: {"action": "EXECUTE", "commands": ["npx create-react-app my-app"], "reason": null}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+§11  PRE-OUTPUT CHECK
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-       USER: "Why is app slow? Check logs"
-       First: {"action": "INSPECT", "commands": ["tail -n 100 /var/log/app.log"], "reason": null}
-       If insufficient: {"action": "UPLOAD", "commands": ["/var/log/app.log"], "reason": "Need full log analysis to identify performance bottlenecks"}
+Before emitting output, confirm:
+  ✓ Exactly one JSON object — no surrounding text
+  ✓ reason is null (not "") for INSPECT and EXECUTE
+  ✓ commands is [] (not omitted) for ASK and BLOCK
+  ✓ No bash -lc or sh -c wrapping in commands
+  ✓ Long-running command → EXECUTE, not avoided
+  ✓ BLOCK reason starts with "Action blocked:"
+  ✓ REVIEW reason includes a backup or rollback command
+  ✓ Destructive op path is absolute — "/" → BLOCK
+  ✓ External tool confirmed via INSPECT before EXECUTE
 
-       --------------------------------
-       REMEMBER
-       --------------------------------
-       - Be deterministic and explicit
-       - Safety > convenience
-       - INSPECT before assuming
-       - ASK rather than guess
-       - One JSON object, nothing else
-       - Preserve security boundaries
-       - Prefer boring over clever
-       - Return EXACTLY one JSON object per response
-       - NEVER execute destructive commands on relative paths without resolving them to an absolute path first.
-       - If resolved path is '/', BLOCK immediately.
-       - Treat '.', './', '../', or empty paths as UNKNOWN until inspected.
-       """.strip()
-    base_llm: BaseLLM
+Be deterministic. Be safe. If unsure → ASK. One JSON object. Nothing else.
+
+    """.strip()
+    TIME_OUT = 25
 
     def __init__(self, base_llm: BaseLLM):
+        self.PROJECT_ROOT = Path(__file__).resolve().parents[1]
         self.base_llm = base_llm
+        self.CONTEXT_TRACKER = 0
+        self.PENDING_ASK = None
+        self.PENDING_ASK_ORIGINAL_INPUT = None
+        self.PENDING_REVIEW = None
+        self.PENDING_REVIEW_HASH = None
+        self.PENDING_REVIEW_REASON = None
+        print(f"[ThinkShell] Project root set to: {self.PROJECT_ROOT}")
 
     FORBIDDEN_PATTERNS = [
         r"\brm\s+-rf\b",
@@ -260,6 +237,17 @@ class Decision:
         r"\bchmod\s+-R\s+777\s+/\b",
         r"\bmv\s+/\b",
         r">\s*/dev/sd[a-z]",
+        r">\s*/etc/",
+        r">\s*/bin/",
+        r">\s*/usr/",
+        r">\s*/root/",
+        r">\s*/var/",
+        r">\s*\$HOME/\.ssh"
+    ]
+    STRUCTURAL_VIOLATIONS = [
+        r"\bbash\s+-c\b",
+        r"\bsh\s+-c\b",
+        r"\bzsh\s+-c\b",
     ]
 
     SENSITIVE_UPLOAD_PATTERNS = [
@@ -298,6 +286,11 @@ class Decision:
         for pattern in self.FORBIDDEN_PATTERNS:
             if re.search(pattern, cmd):
                 return False
+        for pattern in self.STRUCTURAL_VIOLATIONS:
+            if re.search(pattern, cmd):
+                return False
+        if "&&" in cmd and re.search(r"\brm\b|\bmv\b|\bchmod\b", cmd):
+            return False
         return True
 
     def _is_sensitive_upload_path(self, p: str) -> bool:
@@ -307,56 +300,41 @@ class Decision:
                 return True
         return False
 
-    def _hash_commands(self, commands: list[str]) -> str:
+    @staticmethod
+    def _hash_commands(commands: list[str]) -> str:
         joined = "\n".join(commands).encode("utf-8")
         return hashlib.sha256(joined).hexdigest()
 
     def _validate_file(self, path: str) -> bool:
         if not os.path.exists(path):
-            print(f"echo 'File not found: {path}'")
-            return False
+            raise RuntimeError(f"File not found: {path}")
         if not os.path.isfile(path):
-            print(f"echo 'Not a file: {path}'")
-            return False
+            raise RuntimeError(f"Not a file: {path}")
         if self._is_sensitive_upload_path(path):
-            print(f"echo 'Sensitive file blocked: {path}'")
-            return False
+            raise RuntimeError(f"Sensitive file blocked: {path}")
         try:
             if os.path.getsize(path) > self.MAX_UPLOAD_BYTES_PER_FILE:
-                print(f"echo 'File too large: {path}'")
-                return False
+                raise RuntimeError(f"File too large: {path}")
         except OSError:
-            print(f"echo 'Error checking file size: {path}'")
-            return False
+            raise RuntimeError(f"Error checking file size: {path}")
         return True
 
-    def _upload_file_to_llm(self, path: str) -> str | None:
-        try:
-            with open(path, "rb") as f:
-                # Using files.create as it is the standard way to upload files and get a file ID
-                file_object = self.client.files.create(
-                    file=f,
-                    purpose="assistants"
-                )
-            return file_object.id
-        except Exception as e:
-            print(f"echo 'Upload failed for {path}: {e}'")
-            return None
-
-    @staticmethod
-    def run_command(cmd: str) -> str:
+    def run_command(self, cmd: str) -> str:
         # Used only for INSPECT steps (internal state gathering).
         try:
+            args = shlex.split(cmd)
             result = subprocess.run(
-                cmd,
-                shell=True,
+                args,
+                cwd=self.PROJECT_ROOT,
+                shell=False,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=self.TIME_OUT,
+                stdin=subprocess.DEVNULL,
             )
-            return (result.stdout + result.stderr).strip()[:4000]
-        except Exception as e:
-            return f"ERROR: {str(e)}"
+            return result.stdout.strip() or result.stderr.strip()
+        except subprocess.TimeoutExpired:
+            return "INSPECT_TIMEOUT"
 
     @staticmethod
     def safe_echo(msg: str) -> str:
@@ -382,9 +360,17 @@ class Decision:
             self.PENDING_REVIEW_HASH = self._hash_commands(commands)
             self.PENDING_REVIEW_REASON = str(reason or "")
             preview = "\n".join(commands)
-            return f"REVIEW REQUIRED: {self.PENDING_REVIEW_REASON}\n\nProposed Commands: {preview} \n\nIf you approve, run:confirm:yes"
+            message = (
+                "REVIEW REQUIRED\n"
+                "────────────────────────────────────\n"
+                f"Reason:\n{self.PENDING_REVIEW_REASON}\n\n"
+                f"Proposed Commands:\n{preview}\n\n"
+                "To approve, type:\nconfirm:yes"
+            )
+
+            return self.safe_echo(message)
         except Exception as e:
-            return f"ERROR-----Review block: {str(e)}"
+            return self.safe_echo(f"ERROR — Review block: {str(e)}")
 
     def _execute_review(self, user_input: str) -> str | None:
         """
@@ -396,7 +382,7 @@ class Decision:
             return None
 
         if not self.PENDING_REVIEW:
-            return "No pending operation to confirm."
+            return self.safe_echo("No pending operation to confirm.")
 
         commands = self.PENDING_REVIEW
         expected_hash = self.PENDING_REVIEW_HASH
@@ -406,31 +392,28 @@ class Decision:
             self.PENDING_REVIEW = None
             self.PENDING_REVIEW_HASH = None
             self.PENDING_REVIEW_REASON = None
-            return "Review invalidated (command mismatch)."
+            return self.safe_echo("Review invalidated (command mismatch).")
 
-        output = []
         for cmd in commands:
             if not self.is_runtime_safe(cmd):
                 self.PENDING_REVIEW = None
                 self.PENDING_REVIEW_HASH = None
                 self.PENDING_REVIEW_REASON = None
-                return f"Blocked during execution: {cmd}"
-
-            output.append(self.run_command(cmd))
+                return self.safe_echo(f"Blocked during execution: {cmd}")
 
         # Clear state (commit complete)
         self.PENDING_REVIEW = None
         self.PENDING_REVIEW_HASH = None
         self.PENDING_REVIEW_REASON = None
 
-        return "\n".join(output) if output else "Done."
+        return "\n".join(commands)
 
-    @staticmethod
-    def _emit_pause(message: str) -> str:
-        return f"{message}\n\n⏸ Execution paused. Respond to continue."
+    def _emit_pause(self, message: str) -> str:
+        return self.safe_echo(message + "\n⏸ Execution paused. Respond to continue.")
 
     def init_ai_terminal(self):
-        self.base_llm.init_ai_terminal(system_prompt=self.SYSTEM_PROMPT,os_info=self.OS_INFO)
+        self.base_llm.load_state()
+        self.base_llm.init_ai_terminal(system_prompt=self.SYSTEM_PROMPT, os_info=self.OS_INFO)
 
     def _interactive_ask_snippet(self, reason: str) -> str:
         combined = (
@@ -455,12 +438,6 @@ class Decision:
             return self.base_llm.call_llm(f"USER_INPUT: {user_input}")
         return self.base_llm.call_llm(f"ASK_RESPONSE: {user_input}")
 
-    def _cli_safe(self, text: str) -> str:
-        """
-        Escapes text so the outer CLI can safely wrap it in: echo '...'
-        """
-        return text.replace("'", "'\"'\"'")
-
     def ai_terminal(self, user_input: str) -> str:
         """
         Event-driven agent loop using Responses API correctly.
@@ -468,16 +445,14 @@ class Decision:
         """
         review_result = self._execute_review(user_input)
         if review_result is not None:
-            return self._cli_safe(review_result)
-        self.reset_review()
+            return review_result
+
         is_ask_resume = self.PENDING_ASK is not None
         if is_ask_resume:
             user_input = self._interactive_ask_snippet(user_input)
 
-        if self.base_llm.LLM_RESPONSE_ID is None:
-            self.init_ai_terminal()
         elif self.CONTEXT_TRACKER > self.MAX_CONTEXT_LENGTH:
-            self.base_llm.summarize_and_reset(self.SYSTEM_PROMPT,self.OS_INFO)
+            self.base_llm.summarize_and_reset(self.SYSTEM_PROMPT, self.OS_INFO)
             self.CONTEXT_TRACKER = 0
         MAX_STEPS = 12
         seen_inspects: set[str] = set()
@@ -506,14 +481,15 @@ class Decision:
                     if not self.is_runtime_safe(cmd):
                         inspection_output[cmd] = "BLOCKED: runtime safety guard"
                         continue
-
-                    print(f"echo 'Inspecting command: {cmd}'")
+                    print(f"[INSPECT] {cmd}", file=sys.stderr)
                     inspection_output[cmd] = self.run_command(cmd)
                     seen_inspects.add(cmd)
 
                 llm_response = self.base_llm.call_llm(
-                    "INSPECTION_RESULT:\n" +
-                    json.dumps(inspection_output, ensure_ascii=False)
+                    json.dumps({
+                        "event": "INSPECTION_RESULT",
+                        "data": inspection_output
+                    }, ensure_ascii=False)
                 )
                 continue
 
@@ -527,21 +503,26 @@ class Decision:
                     if path in uploaded_files:
                         continue
 
-                    if self._validate_file(path):
-                        print(f"echo 'Uploading file {path}'")
-                        file_id = self._upload_file_to_llm(path)
+                    try:
+                        self._validate_file(path)
+                    except RuntimeError as e:
+                        payload[path] = str(e)
+                        continue
 
-                        if file_id:
-                            payload[path] = file_id
-                            uploaded_files.add(path)
-                        else:
-                            payload[path] = "UPLOAD_FAILED"
+                    file_id = self.base_llm.upload_file_to_llm(path)
+                    if file_id:
+                        payload[path] = file_id
+                        uploaded_files.add(path)
                     else:
-                        payload[path] = "VALIDATION_FAILED"
+                        payload[path] = "UPLOAD_FAILED"
 
                 llm_response = self.base_llm.call_llm(
-                    "UPLOADED_FILES:\n" +
-                    json.dumps(payload, ensure_ascii=False)
+                    json.dumps(
+                        {
+                            "event": "UPLOADED_FILES",
+                            "data": payload
+                        }
+                        , ensure_ascii=False)
                 )
                 continue
 
@@ -552,40 +533,36 @@ class Decision:
                 if self.PENDING_ASK_ORIGINAL_INPUT is None:
                     self.PENDING_ASK_ORIGINAL_INPUT = user_input
                 self.PENDING_ASK = str(reason or "Need more information.")
-                return self._cli_safe(self._emit_pause(
-                    self.PENDING_ASK + "\n\nProvide the answer in your next command."
-                ))
+                return self._emit_pause(
+                    self.PENDING_ASK + "\nProvide the answer in your next command."
+                )
 
             # ============================================================
             # REVIEW → confirmation workflow
             # ============================================================
             if action == "REVIEW":
                 self.reset_ask_loop()
-                return self._cli_safe(self._interactive_review_snippet(str(reason or ""), commands))
+                return self._interactive_review_snippet(str(reason or ""), commands)
 
             # ============================================================
             # EXECUTE → execute safe commands
             # ============================================================
             if action == "EXECUTE":
-                result = []
                 self.reset_ask_loop()
                 for cmd in commands:
                     if not self.is_runtime_safe(cmd):
-                        return self._cli_safe(
+                        return self.safe_echo(
                             "Execution blocked by runtime safety guard, for command : " + cmd
                         )
 
-                    print(f"echo 'Executing command : {cmd}'")
-                    result.append(self.run_command(cmd))
-
-                return self._cli_safe("\n".join(result) if commands else self.safe_echo("No commands provided."))
+                return "\n".join(commands) if commands else "echo 'No commands provided.'"
 
             # ============================================================
             # BLOCK → hard stop
             # ============================================================
             if action == "BLOCK":
                 self.reset_ask_loop()
-                return self._cli_safe(str(reason or "Action blocked."))
+                return self.safe_echo(str(reason or "Action blocked."))
 
             # ============================================================
             # Unknown action → ask model to correct itself (event again)
