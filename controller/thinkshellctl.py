@@ -39,8 +39,6 @@ def main() -> int:
     Usage:
         thinkshellctl.py FAIL "<original command>"
     """
-    if os.environ.get("THINKSHELL_ACTIVE") == "1":
-        return 0
     if len(sys.argv) < 3:
         # Do NOT print to stdout — this breaks shell contract.
         print("[ThinkShell] Invalid invocation.", file=sys.stderr)
