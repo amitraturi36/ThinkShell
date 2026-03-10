@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 import os
 import sys
+import signal
 from pathlib import Path
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully - exit silently."""
+    sys.exit(130)  # Standard exit code for SIGINT
+
+
+# Register signal handler BEFORE any imports
+signal.signal(signal.SIGINT, signal_handler)
 
 
 def _bootstrap_import_path() -> None:
@@ -39,25 +49,25 @@ def main() -> int:
     Usage:
         thinkshellctl.py FAIL "<original command>"
     """
-    if len(sys.argv) < 3:
-        # Do NOT print to stdout — this breaks shell contract.
-        print("[ThinkShell] Invalid invocation.", file=sys.stderr)
-        return 1
-
-    mode = sys.argv[1]
-
-    # Preserve full original command (handles quoted args safely)
-    command = " ".join(sys.argv[2:]).strip()
-
-    if not command:
-        print("[ThinkShell] Empty command received.", file=sys.stderr)
-        return 1
-
-    if mode != "FAIL":
-        print(f"[ThinkShell] Unsupported mode: {mode}", file=sys.stderr)
-        return 1
-
     try:
+        if len(sys.argv) < 3:
+            # Do NOT print to stdout — this breaks shell contract.
+            print("[ThinkShell] Invalid invocation.", file=sys.stderr)
+            return 1
+
+        mode = sys.argv[1]
+
+        # Preserve full original command (handles quoted args safely)
+        command = " ".join(sys.argv[2:]).strip()
+
+        if not command:
+            print("[ThinkShell] Empty command received.", file=sys.stderr)
+            return 1
+
+        if mode != "FAIL":
+            print(f"[ThinkShell] Unsupported mode: {mode}", file=sys.stderr)
+            return 1
+
         fix = llm_engine.get_bash_command(command)
 
         # IMPORTANT:
@@ -69,6 +79,9 @@ def main() -> int:
 
         return 1
 
+    except KeyboardInterrupt:
+        # Silent exit on Ctrl+C
+        sys.exit(130)
     except Exception as e:
         print(f"echo '[ThinkShell] Execution error:{e}'")
         return 0
