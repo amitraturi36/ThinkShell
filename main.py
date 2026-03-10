@@ -176,6 +176,9 @@ def interactive_setup(cfg: dict):
         print("Invalid choice. Skipping AI setup.")
 
 def main():
+    if os.environ.get("THINKSHELL_ACTIVE") == "1":
+        print("Already inside Thinkshell")
+        return 0
     # 1. Check Command Line Arguments
     parser = argparse.ArgumentParser(description="ThinkShell Launcher")
     parser.add_argument("--openai_key", help="OpenAI API Key")
